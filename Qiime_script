@@ -1,0 +1,143 @@
+# This is (hopefully) the complete code that I used for analysis of the Cyprinella microbiome project. I also have more failed/unused analysis backed up in other files
+# Contents include: Qiime, Permanova, NMDS, Mantel tests, Alpha diversity Boxplots, Linear models, Network analysis, Map
+# Author: Will Hanson-Regan July 2023
+
+### Qiime ######
+
+  ## credit to Francesca Leasi for all of this, I basically just made slight moderations to make it specific to my data.
+  ## This was done in the SimCenter Epyc cluster, accessed with command prompt. 
+  ## These codes are specific to the 16S, the 18S process was nearly identical except for less stringent cutoffs
+  ## qiime2 is just one of the many tools you can use. You can use R or many other developed tools. You can find the tutorial here https://docs.qiime2.org/2023.2/tutorials/moving-pictures/
+  ## they update it very often so this link may not work in just a few weeks, but look for "moving-pictures".
+  ## you got your sequences in a .gz file, which is a compressed fastq, which means DNA sequences + information about sequence quality. Every file includes either all the F or the R for each sample
+  ## you can open one using Geneious or another software and get an idea of how many genetic reads you have for each samples...then realize it is impossible to use Geneioius...
+  
+  #STEP 1: IMPORT READS INTO THE SERVER. download your reads on your computer. In my case, I downloaded the reads into a folder named "will" located on the desktop. Therefore create a folder in your server account:
+  scp Microbiome/Microbiome_results_16s/*.gz whansonregan@epyc.simcenter.utc.edu:/home/whansonregan/microbiome/16s
+  
+  #check if all your reads are there by asking how many .gz files are in raw_reads
+  cd raw_reads
+  ls -1 *.gz | wc -l
+  
+  #STEP 2: ACTIVATE QIIME2. qiime2 should be installed in the Epyc cluster.
+  module load anaconda 
+  #check the last version, they update the software very often. I keep asking Corbin to update it.
+  conda info --envs
+  #choose the last version
+  source activate qiime2-2022.11
+  
+  #STEP 3: PAIR DEMULTIPLEXED READS we are in the directory will_fernando. We want to import data from the raw_reads directory to an artifact zip file of Qiime2 having extension .qza. Because it can be a relatively long process
+  #the 'nohup' and '&' allow you to close your computer and let it run but itself. 
+  nohup qiime tools import --type 'SampleData[PairedEndSequencesWithQuality]' --input-path 16s/ --input-format CasavaOneEightSingleLanePerSampleDirFmt --output-path demux-paired-end-16s.qza &
+    #To check if it is still running, you can type 
+    jobs
+  #if there is some mistake, it will show up as EXIT, then check what the problem was by typing
+  less nohup
+  
+  #STEP 4 CHECK THE QUALITY. you can start visualizing your data. These visualizations are important for data filtering. First, convert the .qza file into a .qzv file.
+  qiime demux summarize --i-data demux-paired-end-16s.qza --o-visualization demux-paired-16s.qzv 
+  #export your .qzv file in your computer. you need to open another bash window without logging it
+  scp -r whansonregan@epyc.simcenter.utc.edu:/home/whansonregan/microbiome/demux-paired-16s.qzv Microbiome
+  #then you can drag your demux-paired.qzv file into this website https://view.qiime2.org/ and explore it. You want to check both pages, the interactive quality plot gives you an idea of the sequence quality
+  
+  #STEP 5: DENOISING AND FILTERING.DADA2 pipeline
+  qiime demux summarize --i-data single-end.qza --o-visualization single_end.qzv 
+  nohup qiime dada2 denoise-single --i-demultiplexed-seqs single-end.qza --o-table sv-table_f100_247 --o-representative-sequences rep-seqs_f100_247  --p-n-threads 30 --p-trim-left 100 --p-trunc-len 247 &
+    #check the output
+    qiime metadata tabulate --m-input-file stats-dada.qza --o-visualization stats-dada.qzv
+  
+  #STEP 6: IMPORT YOUR REFERENCE DATABASE. Create a database folder from your main directory (/home/fleasi) so it can be used for any of your project
+  mkdr database
+  cd database
+  #We are using the manually curated SILVA database 
+  #import the database into a .qza file recognized by qiime2. go into the "database" directory
+  #The databases has to be downloaded onto the server from the the ARB-SILVA website: https://www.arb-silva.de/download/archive/qiime
+  wget https://www.arb-silva.de/fileadmin/silva_databases/qiime/Silva_132_release.zip 
+  # unzip the file 
+  unzip -xvzf Silva_132_release.zip 
+  #you are in your database folder, now extract the two files of interest ino a qza filet. First, the sequences.
+  qiime tools import --type FeatureData[Sequence] --input-path SILVA_132_QIIME_release/rep_set/rep_set_16S_only/99/silva_132_99_16S.fna --output-path 99_otus_16S 
+  #now extract the taxonomic information
+  qiime tools import --type FeatureData[Taxonomy] --input-path SILVA_132_QIIME_release/taxonomy/16S_only/99/majority_taxonomy_7_levels.txt --source-format HeaderlessTSVTaxonomyFormat --output-path majority_taxonomy_7_levels#For eukaryotic 18S data the databases are pretty sparse, it is recommended using the majority_taxonomy_7_levels.txt since it does a better job of incorporating 
+  #"environmental" rRNA sequences and the seven levels have been manually curated to better reflect the known phylogenetic classifications of diverse eukarytoic groups.
+  
+  #STEP 7. CLASSIFY SEQUENCES AND ASSIGN TAXONOMIC NAMES
+  #it is essential to understand the value of pairwise identity. I use 90%, wich is the usual cutoff for phylum. So, all the sequences that are not 
+  #at least 90% similar to what is in the database will result unassigned. Increasing the number would increase accuracy (--cutoff_species 97 --cutoff_family 93 --cutoff_phylum 90)
+  #however, you would lose information because too many sequences will result unassigned. 
+  #take a look at the code below and make sure it is clear.
+  #rep-seqs-f15-210_r80-140.qza is your input sequences after trimming
+  #silva_18S_reference_taxonomy.qza is the taxonomy you have extracted from Silva, as you noticed, I transfer that file into a directory here: /home/fleasi/databases/Qiime_18S_data/ so you will never have to change your script for future works
+  #silva_18S_reference.qza is the file with the sequences extracted from Silva. Again, I transfer it into the same folder as above
+  #The output file generated by the "--o-search-results" option contains the raw BLAST search results. These results include information about the best hits for each query sequence, including the reference sequence IDs, E-values, bit scores, and alignment lengths.
+  #The output file generated by the "--o-classification" option contains the taxonomic classifications assigned to each query sequence based on the BLAST search results. This output file includes a table that shows the taxonomic lineage for each query sequence, as well as the confidence scores for each taxonomic assignment.
+  nohup qiime feature-classifier classify-consensus-blast --i-query sequences_filtered.qza --i-reference-taxonomy majority_taxonomy_7_levels_16s.qza --i-reference-reads 99_otus_16S.qza  --o-search-results blast-search-results-97.qza --o-classification classification-97.qza --p-perc-identity 0.97 --p-maxaccepts 1 &  
+    #STEP 8. View the output files using qiime2 view
+    qiime metadata tabulate --m-input-file classification-final.qza --o-visualization classification-final.qzv 
+  qiime metadata tabulate --m-input-file blast-search-results-97.qza --o-visualization blast-search-results-97.qzv 
+  
+  #STEP 9. What to do with this classification? You can download a TSV file and open it with excel, then play around. What taxa make sense and what taxa you should take off? That depends also on your research question.
+  #Once you have figured out, it is time to filter your dataset and retain only what you want
+  #what I do is not the most elegant way, I know there is one easier and more straightforward but I need some time to look for it, so, in a rushed situation here it goes.
+  #let's filter your output sv-table.qza The table has the list of features (=OTUs) organized by sample. You need to replace names beased on your output
+  qiime taxa filter-table --i-table sv-table_f100_247.qza --i-taxonomy classification-f100-247.qza --p-exclude Unassigned --o-filtered-table sv-table-no-unass.qza 
+  #I just put unassigned for the moment because it's worth spending a few hours looking at the taxonomy and figure out what to discard. More taxa can be added by typing --p-exclude Unassigned, taxon1, taxon2, ...
+  #next do the same with your sequences
+  qiime taxa filter-seqs --i-sequences rep-seqs_f100_247.qza --i-taxonomy classification-97.qza --p-exclude Chloroplast --o-filtered-sequences sequences-no-chloro.qza
+  #next filter the classification, so this is the very unelegant way...such as what I do is re-running step7 with new filtered files. I know there is a way to filter the classification. I just prefer to tell you what I know right away so we are not stalling
+  
+  
+  #extract table
+  qiime tools export --input-path sv-table_f100_247.qza --output-path exported-feature-table-nofilter
+  #convert .biom into tsv
+  biom convert -i feature-table.biom -o feature-table.tsv --to-tsv
+  # Filter 
+  filter_taxa_from_otu_table.py -i feature-table.biom -o filtered_feature_table.biom -n "Chloroplast"
+  
+  # Step 10 Filter
+  # For 16s, I filtered out unassigned, chloroplast, and any SVs present in less than 1 sample with less than 10 reads
+  #filter features based on their ID. This is easy but first you need to create an excel file including only the feature IDs (eg, 507de02aec1f834850a8ca01adfc8d73) you want to keep. 
+  #You have the complete list in column 1 named "OTU". In column 2, you copy and paste what Fernando gave you
+  #column 2 is named "todelete" You can do it in R
+  otus<-read.csv('OTUs.csv', header=T)
+  names_to_delete <- otus$todelete
+  filtered <- otus[!otus$OTU %in% names_to_delete, ]
+  write.csv(filtered,"/Users/qkr945/Desktop/will/filtered.csv")
+  
+  #Now, you have the list of otus you want to keep in column 1 of your csv. Delete all the extra information and name column 1 like that: '#OTU ID' without quotations
+  #convert it into a txt and then tsv file and import in qiime
+  #Then run this script. I am not sure if the final table was f15-210_r80-140. We may go back and see which one is the final and delete the other ones. 
+  qiime feature-table filter-features --i-table sv-table-f15-210_r80-140.qza --m-metadata-file filtered.tsv --o-filtered-table sv-table-filtered.qza
+  
+  #once you have filtered the feature table, you want to use it as a reference to filter your sequences from your original sequence file
+  qiime feature-table filter-seqs --i-data rep-seqs-f15-210_r80-140.qza --i-table sv-table-complete-filtered.qza --o-filtered-data rep-seqs-complete-filtered.qza
+  
+  #I now import the metadata file after saving it in .tsv
+  scp -r  Desktop/will/mapping-file-18s.tsv fleasi@ts.simcenter.utc.edu:/home/fleasi/will_fernando/
+    
+    #finally, we can get the barplot, but first (there is probably a better way), I reclassify the filtered data through SILVA using a 90% cutoff
+    nohup qiime feature-classifier classify-consensus-blast --i-query rep-seqs-complete-filtered.qza --i-reference-taxonomy ~/databases/Qiime_18S_data/silva_18S_reference_taxonomy.qza --i-reference-reads ~/databases/Qiime_18S_data/silva_18S_reference.qza  --o-classification classification-filtered.qza --p-perc-identity 0.90 --p-maxaccepts 1 &
+    
+    #barplot
+    qiime taxa barplot --i-table sv-table-f100_247.qza --i-taxonomy classification-97-filtered.qza --m-metadata-file 16s_metadata.tsv  --o-visualization taxa-bar-plots-16s.qzv
+  
+  
+  #to filter ASVs (=amplicon sequence variants, used sometimes as a synonym of OTU, but they are different) by number of the number of reads (10 reads minimum per ASV)
+  qiime feature-table filter-samples --i-table sv-table-filtered.qza --p-min-frequency 10 --o-filtered-table sv-table-filtered-10reads.qza
+  
+  #to filter ASVs by number of the samples they are represented (discard the ones present in only one sample)
+  qiime feature-table filter-features --i-table sv-table-filtered-10reads.qza --p-min-samples 3 --o-filtered-table sv-table-filtered-10reads-1sample.qza
+  
+  #now, use the last table to get your list of sequences and redo the classification in case you lost some SV (pretty sure there is away to filter from the classification without redoing the blast...I will check one day..)
+  qiime feature-table filter-seqs --i-data sequences-filtered.qza --i-table sv-table-filtered-10reads-1sample.qza --o-filtered-data rep-seqs-filtered-10reads-1sample.qza
+  #Classification
+  nohup qiime feature-classifier classify-consensus-blast --i-query rep-seqs-filtered-10reads-1sample.qza --i-reference-taxonomy majority_taxonomy_7_levels_16s.qza --i-reference-reads 99_otus_16S.qza  --o-search-results blast-search-results-final.qza --o-classification classification-final.qza --p-perc-identity 0.97 --p-maxaccepts 1 &  
+    
+    #to pool SVs by species + site, first add the new column in the tsv file to create such category per each single sample. Let's say, you call the column 'speciesite'
+    #Therefore, make the new table with samples pooled in that category. Use it just for the barplot, the rest of the analyses very likely will need each single sample separated. 
+    qiime feature-table group --i-table sv-table-filtered-10reads-1sample.qza --p-axis 'sample' --m-metadata-file 16s_metadata.tsv --m-metadata-column "Site_x_species" --p-mode 'mean-ceiling' --o-grouped-table table_grouped_by-speciesite.qza
+  #you don't have to produce new sequences or new classification for this grouping
+  
+  #to extract fasta file
+  qiime tools export --input-path rep-seqs-filtered-10reads-1sample.qza --output-path 16s-fasta-sequences-filtered
+  
